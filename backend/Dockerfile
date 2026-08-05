@@ -2,12 +2,14 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# System deps required by OpenCV and rembg
+# --- CHANGED SECTION: image size ---
+# libgl1 dropped — opencv-python-headless doesn't link against Mesa/OpenGL,
+# only the full opencv-python GUI build needs it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
     libglib2.0-0 \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+# -----------------------
 
 # Install uv
 RUN pip install --no-cache-dir uv
