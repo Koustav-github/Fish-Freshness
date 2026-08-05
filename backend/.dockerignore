@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+*.ipynb
+*.bat
+images/
+build_yolo_notebook.py
+test.py
