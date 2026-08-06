@@ -31,7 +31,7 @@ interface PredictResponse {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const API_URL = "http://localhost:8000/predict";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://fish-freshness-2.onrender.com/predict";
 
 const LOADING_STEPS = [
   { label: "Segmenting fish region", icon: "✂️" },
