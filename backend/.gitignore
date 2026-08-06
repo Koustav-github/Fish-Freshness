@@ -2,4 +2,7 @@
 
 /.venv
 /__pycache__
-/sagemaker
+/sagemaker/code/__pycache__
+/sagemaker/models
+/sagemaker/model.tar.gz
+

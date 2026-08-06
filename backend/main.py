@@ -16,14 +16,10 @@ import requests as _requests
 # but keep if required elsewhere. Removed tf.keras load_model.
 # -----------------------
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 load_dotenv()
 
@@ -79,7 +75,7 @@ def generate_llm_analysis(label: str, confidence: float, decision: str,
         try:
             url  = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
             )
             body = {"contents": [{"parts": [{"text": prompt}]}]}
             r    = _requests.post(url, json=body, timeout=10)
@@ -109,7 +105,7 @@ def generate_llm_analysis(label: str, confidence: float, decision: str,
 
 
 # ── Image guardrails ──────────────────────────────────────────────────────────
-MAX_IMAGE_DIM        = 4096   # px — above this segmentation risks OOM
+MAX_IMAGE_DIM        = 4096   # px — hard reject above this, before any processing
 MIN_IMAGE_DIM        = 128    # px — below this segmentation is unreliable
 MAX_B64_BYTES        = 5 * 1024 * 1024   # 5 MB of raw base64 text
 
@@ -123,32 +119,28 @@ async def lifespan(app: FastAPI):
 # -----------------------
 
 
-# ── Rate limiter (SlowAPI) ────────────────────────────────────────────────────
-limiter = Limiter(key_func=get_remote_address)
-
-
 # ── App ───────────────────────────────────────────────────────────────────────
+# --- CHANGED SECTION: move to Lambda ---
+# Dropped slowapi rate limiting — its in-memory counter doesn't persist
+# across ephemeral Lambda containers (each cold start gets its own memory),
+# so it silently stopped being an actual limit. Throttling now happens at
+# the Lambda Function URL / reserved concurrency level instead.
 app = FastAPI(title="FreshlyFishy API", lifespan=lifespan)
+# -----------------------
 
-app.state.limiter = limiter
-def _rate_limit_handler(*_):
-    return JSONResponse(
-        status_code=429,
-        content={
-            "error":   "rate_limit_exceeded",
-            "detail":  "Too many requests — limit is 5 per minute per IP. Please wait before retrying.",
-            "retry_after_seconds": 60,
-        },
-    )
-
-app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
-
+# --- CHANGED SECTION: CORS ownership ---
+# Handled here only — the Lambda Function URL's own CORS config must stay
+# OFF. Having both inject Access-Control-Allow-Origin produces a duplicate
+# value ("*, *"), which browsers reject outright, and relying on the
+# Function URL alone left OPTIONS preflight requests with no CORS headers
+# at all (Starlette's bare default OPTIONS response, not CORS-aware).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# -----------------------
 
 
 # ── Request schema ────────────────────────────────────────────────────────────
@@ -361,8 +353,7 @@ def apply_clahe(bgr: np.ndarray) -> np.ndarray:
 # ── Predict endpoint ──────────────────────────────────────────────────────────
 
 @app.post("/predict")
-@limiter.limit("5/minute")
-def predict(request: Request, req: ImageRequest):
+def predict(req: ImageRequest):
     t0 = time.perf_counter()
 
     try:

@@ -31,7 +31,7 @@ interface PredictResponse {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://fish-freshness-2.onrender.com/predict";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "https://4fvzwxwupnm2rr6tsmzfz5alqe0mubjh.lambda-url.us-east-1.on.aws/predict";
 
 const LOADING_STEPS = [
   { label: "Segmenting fish region", icon: "✂️" },
@@ -1180,6 +1180,7 @@ export default function Home() {
   const [previewSrc,   setPreviewSrc]   = useState<string | null>(null);
   const [loadStep,     setLoadStep]     = useState(0);
   const [tipIdx,       setTipIdx]       = useState(0);
+  const [serverWaking, setServerWaking] = useState(false);
   const [isDragOver,   setIsDragOver]   = useState(false);
   const [lightbox,     setLightbox]     = useState<{ src: string; label: string } | null>(null);
   const [shutterFlash, setShutterFlash] = useState(false);
@@ -1240,12 +1241,17 @@ export default function Home() {
     setResult(null);
     setPreviewSrc(dataUrl);
     setLoadStep(0);
+    setServerWaking(false);
     const timers = [
       setTimeout(() => setLoadStep(1), 600),
       setTimeout(() => setLoadStep(2), 1600),
       setTimeout(() => setLoadStep(3), 2800),
     ];
     const tipTimer = setInterval(() => setTipIdx((i) => (i + 1) % TIPS.length), 2800);
+    // A warm backend responds in 1-2s. Past 8s, this is almost certainly
+    // Render's free-tier cold start (idle services spin down and take
+    // 30-50s to wake back up) rather than a stuck/broken request.
+    const wakeTimer = setTimeout(() => setServerWaking(true), 8000);
     try {
       const b64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
       const res = await fetch(API_URL, {
@@ -1262,8 +1268,10 @@ export default function Home() {
       setError((e as Error).message);
     } finally {
       timers.forEach(clearTimeout);
+      clearTimeout(wakeTimer);
       clearInterval(tipTimer);
       setLoading(false);
+      setServerWaking(false);
     }
   }, []);
 
@@ -1607,6 +1615,15 @@ export default function Home() {
                         );
                       })}
                     </div>
+
+                    {serverWaking && (
+                      <div className="w-full rounded-xl border border-amber-500/20 px-5 py-3.5" style={{ background: "rgba(245,158,11,0.05)" }}>
+                        <p className="text-xs text-amber-400/90 leading-relaxed">
+                          <span className="font-medium">Waking up the server. </span>
+                          This backend spins down when idle — the first request can take up to a minute. Subsequent requests will be fast.
+                        </p>
+                      </div>
+                    )}
 
                     <div className="w-full rounded-xl border border-white/5 px-5 py-3.5" style={{ background: "rgba(255,255,255,0.02)" }}>
                       <p className="text-xs text-slate-500 leading-relaxed">
