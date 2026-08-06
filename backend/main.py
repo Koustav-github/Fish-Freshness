@@ -25,19 +25,29 @@ load_dotenv()
 
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY",   "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-_groq_client   = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+# --- CHANGED SECTION: diagnose 180s+ hang ---
+# Explicit timeout — the Groq SDK's default (unlike the Gemini fallback's
+# requests.post(timeout=10)) was unbounded, a likely culprit for requests
+# hanging far longer than expected with no visible error.
+_groq_client   = Groq(api_key=GROQ_API_KEY, timeout=15.0) if GROQ_API_KEY else None
+# -----------------------
 
 # --- CHANGED SECTION: AWS SageMaker integration ---
 # YOLO + classifier inference now run remotely on a deployed SageMaker
 # endpoint instead of loading the .pt/.onnx models in-process.
 SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME", "fish-freshness-koustav-JU-km").strip()
 AWS_REGION              = os.getenv("AWS_REGION", "us-east-1").strip()
-_sagemaker_runtime      = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
+# --- CHANGED SECTION: diagnose 180s+ hang ---
+# Explicit connect/read timeouts on both AWS clients — without these, boto3
+# has no hard upper bound and a stalled connection can hang far longer than
+# expected, which is exactly what we're trying to rule out here.
+_boto_config = boto3.session.Config(connect_timeout=10, read_timeout=60, retries={"max_attempts": 1})
+_sagemaker_runtime      = boto3.client("sagemaker-runtime", region_name=AWS_REGION, config=_boto_config)
 
 # rembg-based segmentation now runs on a separate Lambda instead of in-process,
 # so this Render deploy doesn't need to carry rembg's ~300MB dependency chain.
 LAMBDA_PREPROCESSING_FUNCTION = os.getenv("LAMBDA_PREPROCESSING_FUNCTION", "fish-preprocess").strip()
-_lambda_client                = boto3.client("lambda", region_name=AWS_REGION)
+_lambda_client                = boto3.client("lambda", region_name=AWS_REGION, config=_boto_config)
 # -----------------------
 
 
@@ -216,19 +226,33 @@ def invoke_sagemaker(b64_image: str) -> dict:
 
 # ── Fish detection via remote rembg Lambda (local GrabCut fallback) ───────────
 
+# --- CHANGED SECTION: diagnose 180s+ hang ---
+# GrabCut's cost scales with pixel count. Running it at full resolution
+# (e.g. 1600x1600 = 2.56M px) on Lambda's modest CPU allocation (which
+# scales with configured memory) took 159+ seconds and got killed by the
+# function timeout — confirmed via CloudWatch timing logs. Downscaling to a
+# capped working size before segmenting, then scaling the resulting mask
+# back up, keeps this fallback usable regardless of image size.
+GRABCUT_MAX_DIM = 512
+# -----------------------
+
 def _grabcut_mask(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     if h < 32 or w < 32:
         return np.full((h, w), 255, dtype=np.uint8)
 
-    mask        = np.zeros((h, w), np.uint8)
+    scale = min(1.0, GRABCUT_MAX_DIM / max(h, w))
+    small = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else image
+    sh, sw = small.shape[:2]
+
+    mask      = np.zeros((sh, sw), np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
-    mx, my    = max(4, w // 10), max(4, h // 10)
-    rect        = (mx, my, w - 2 * mx, h - 2 * my)
+    mx, my    = max(4, sw // 10), max(4, sh // 10)
+    rect      = (mx, my, sw - 2 * mx, sh - 2 * my)
 
     try:
-        cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5,
+        cv2.grabCut(small, mask, rect, bgd_model, fgd_model, 5,
                     cv2.GC_INIT_WITH_RECT)
         fg = np.where(
             (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0
@@ -236,9 +260,9 @@ def _grabcut_mask(image: np.ndarray) -> np.ndarray:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel, iterations=2)
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,  kernel, iterations=1)
-        if fg.sum() < h * w * 0.05 * 255:
+        if fg.sum() < sh * sw * 0.05 * 255:
             raise ValueError("near-empty mask")
-        return fg
+        return cv2.resize(fg, (w, h), interpolation=cv2.INTER_NEAREST) if scale < 1.0 else fg
     except Exception:
         return np.full((h, w), 255, dtype=np.uint8)
 
@@ -288,7 +312,10 @@ def _bbox_from_mask(mask: np.ndarray, H: int, W: int):
 def detect_fish(image: np.ndarray, b64_image: str):
     H, W = image.shape[:2]
 
+    print("[timing] detect_fish: calling invoke_preprocessing_lambda...")
+    _t = time.perf_counter()
     result = invoke_preprocessing_lambda(b64_image)
+    print(f"[timing] detect_fish: invoke_preprocessing_lambda done in {time.perf_counter()-_t:.1f}s, status={result.get('status')}")
 
     if result.get("status") == "success":
         mask_bytes = base64.b64decode(result["mask_base64"])
@@ -304,7 +331,10 @@ def detect_fish(image: np.ndarray, b64_image: str):
         return None, None
 
     # Lambda unreachable/errored — degrade to local pure-cv2 GrabCut
+    print(f"[timing] detect_fish: falling back to local GrabCut, image shape={image.shape}...")
+    _t = time.perf_counter()
     raw_mask = _grabcut_mask(image)
+    print(f"[timing] detect_fish: GrabCut done in {time.perf_counter()-_t:.1f}s")
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask   = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
     mask   = cv2.morphologyEx(mask,     cv2.MORPH_OPEN,  kernel, iterations=1)
@@ -344,12 +374,6 @@ def apply_clahe(bgr: np.ndarray) -> np.ndarray:
 # -----------------------
 
 
-# ── Grad-CAM Note ─────────────────────────────────────────────────────────────
-# Note: Background-suppressed Grad-CAM (using tf.GradientTape) requires a native 
-# TensorFlow/Keras model structure. Since your classifier is now an ONNX model, 
-# Grad-CAM logic has been bypassed/safely defaulted below to prevent crashes.
-
-
 # ── Predict endpoint ──────────────────────────────────────────────────────────
 
 @app.post("/predict")
@@ -369,7 +393,9 @@ def predict(req: ImageRequest):
     # --- CHANGED SECTION: AWS SageMaker integration ---
     # One remote call replaces the local yolo_fish_present() + classify() pair —
     # the SageMaker endpoint runs the YOLO presence-gate and ONNX classifier together.
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s calling invoke_sagemaker...")
     result = invoke_sagemaker(req.image_base64)
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s invoke_sagemaker done")
 
     if result.get("status") == "rejected":
         raise HTTPException(
@@ -379,9 +405,15 @@ def predict(req: ImageRequest):
 
     label = result["prediction"]["label"]
     conf  = result["prediction"]["confidence"]
+    # gradcam_base64 is a real class-activation heatmap computed server-side
+    # in inference.py, from the classifier's own feature-map output — not a
+    # placeholder. Falls back to None if an older inference.py is deployed.
+    gradcam_b64 = result.get("gradcam_base64")
     # -----------------------
 
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s calling detect_fish...")
     bbox, full_mask = detect_fish(image, req.image_base64)
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s detect_fish done")
     if bbox is None:
         raise HTTPException(status_code=422, detail="No fish foreground could be segmented")
 
@@ -393,15 +425,18 @@ def predict(req: ImageRequest):
 
     decision    = "Auto Approved"
 
-    # --- CHANGED SECTION ---
-    # Grad-CAM code requires Keras GradientTape. Replaced with blank/fallback display if model is ONNX.
-    cam_img = crop.copy()  # Fallback visualization replacement
-    # -----------------------
+    # Fall back to a plain crop only if the endpoint didn't return a heatmap
+    # (e.g. an older inference.py) — keeps /predict from breaking either way.
+    gradcam_b64_out = gradcam_b64 if gradcam_b64 else cv2_to_b64(crop)
 
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s computing roi_display...")
     roi_display = apply_clahe(apply_mask_zero(crop, fish_mask))
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s roi_display done")
 
     focus_areas  = ["Eye clarity", "Gill color", "Skin texture"]
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s calling generate_llm_analysis...")
     llm_analysis = generate_llm_analysis(label, conf, decision, mask_coverage, focus_areas)
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s generate_llm_analysis done")
 
     processing_ms = int((time.perf_counter() - t0) * 1000)
 
@@ -419,7 +454,7 @@ def predict(req: ImageRequest):
         "images": {
             "original": original_b64,
             "roi":      cv2_to_b64(roi_display),
-            "gradcam":  cv2_to_b64(cam_img),
+            "gradcam":  gradcam_b64_out,
         },
         "metadata": {
             "timestamp":         datetime.now(timezone.utc).isoformat(),

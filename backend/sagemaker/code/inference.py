@@ -80,6 +80,27 @@ def _letterbox(image: np.ndarray, size: int) -> np.ndarray:
     return canvas
 
 
+# --- CHANGED SECTION: real GradCAM ---
+# top_activation is the classifier's second output — the last conv feature
+# map before global average pooling, exposed specifically for this (see
+# convert_to_onnx.py). Shape (7, 7, 1280), NHWC/channels-last, since Keras
+# is channels-last by default. Channel-wise mean + ReLU + normalize gives a
+# coarse class-activation map; resizing it up and blending onto the same
+# 224x224 crop the classifier actually saw keeps the heatmap aligned with
+# what the model looked at.
+def _generate_gradcam_overlay(feature_maps: np.ndarray, base_bgr: np.ndarray, alpha: float = 0.45) -> np.ndarray:
+    cam = np.mean(feature_maps, axis=-1)
+    cam = np.maximum(cam, 0)
+    cam_min, cam_max = cam.min(), cam.max()
+    cam = (cam - cam_min) / (cam_max - cam_min) if cam_max > cam_min else np.zeros_like(cam)
+
+    h, w = base_bgr.shape[:2]
+    cam_resized = cv2.resize(cam, (w, h), interpolation=cv2.INTER_LINEAR)
+    heatmap = cv2.applyColorMap((cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    return cv2.addWeighted(base_bgr, 1.0 - alpha, heatmap, alpha, 0)
+# -----------------------
+
+
 def predict_fn(image, models):
     """
     Executes the presence check (YOLO) and classification (both ONNX).
@@ -105,19 +126,29 @@ def predict_fn(image, models):
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32)
     batch = np.expand_dims(rgb, axis=0)
 
-    # 3. Run ONNX classifier inference (already softmax output)
+    # 3. Run ONNX classifier inference (dense_2 output is already softmax'd;
+    #    top_activation is the (7,7,1280) feature map used for GradCAM)
     classifier_input_name = classifier_session.get_inputs()[0].name
-    probs = classifier_session.run(None, {classifier_input_name: batch})[0][0]
+    outputs = classifier_session.run(["dense_2", "top_activation"], {classifier_input_name: batch})
+    probs = outputs[0][0]
+    feature_maps = outputs[1][0]
     idx = int(np.argmax(probs))
     label = CLASS_NAMES[idx]
     conf = float(probs[idx])
+
+    # --- CHANGED SECTION: real GradCAM ---
+    gradcam_overlay = _generate_gradcam_overlay(feature_maps, resized)
+    _, gradcam_buf = cv2.imencode(".jpg", gradcam_overlay)
+    gradcam_b64 = base64.b64encode(gradcam_buf).decode()
+    # -----------------------
 
     return {
         "status": "success",
         "prediction": {
             "label": label,
             "confidence": round(conf, 3)
-        }
+        },
+        "gradcam_base64": gradcam_b64
     }
 
 

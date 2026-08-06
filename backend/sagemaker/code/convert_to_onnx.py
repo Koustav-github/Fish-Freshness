@@ -59,13 +59,26 @@ def convert_classifier():
     export_model = tf.keras.models.clone_model(model, clone_function=clone_fn)
     export_model.set_weights(model.get_weights())
 
+    # --- CHANGED SECTION: real GradCAM ---
+    # Expose "top_activation" (the last conv feature map before global
+    # average pooling, shape (7,7,1280)) as a second output alongside the
+    # final softmax classification. Gives inference.py a real feature map to
+    # build a GradCAM-style heatmap from — the single-output export
+    # previously had no intermediate layer exposed at all.
+    feature_layer = export_model.get_layer("top_activation")
+    dual_output_model = tf.keras.Model(
+        inputs=export_model.inputs,
+        outputs=[export_model.output, feature_layer.output],
+    )
+    # -----------------------
+
     # Matches the model's real input contract: (batch, 224, 224, 3) NHWC,
     # raw 0-255 float32 — the model's own Rescaling layer normalizes
     # internally, and that layer is preserved as part of the exported graph.
     input_signature = (tf.TensorSpec((None, 224, 224, 3), tf.float32, name="input"),)
 
     tf2onnx.convert.from_keras(
-        export_model,
+        dual_output_model,
         input_signature=input_signature,
         opset=17,
         output_path=onnx_path,
