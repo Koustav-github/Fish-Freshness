@@ -37,6 +37,11 @@ _groq_client   = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME", "fish-freshness-koustav-JU-km").strip()
 AWS_REGION              = os.getenv("AWS_REGION", "us-east-1").strip()
 _sagemaker_runtime      = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
+
+# rembg-based segmentation now runs on a separate Lambda instead of in-process,
+# so this Render deploy doesn't need to carry rembg's ~300MB dependency chain.
+LAMBDA_PREPROCESSING_FUNCTION = os.getenv("LAMBDA_PREPROCESSING_FUNCTION", "fish-preprocess").strip()
+_lambda_client                = boto3.client("lambda", region_name=AWS_REGION)
 # -----------------------
 
 
@@ -96,18 +101,15 @@ def generate_llm_analysis(label: str, confidence: float, decision: str,
     )
 
 
-try:
-    from rembg import remove as _rembg_remove
-    from PIL import Image as _PILImage
-    REMBG_AVAILABLE = True
-    print("rembg available — using U²-Net for fish segmentation ✅")
-except ImportError:
-    REMBG_AVAILABLE = False
-    print("rembg not installed — GrabCut fallback active")
+# --- CHANGED SECTION: preprocessing moved to Lambda ---
+# rembg no longer imported locally — segmentation runs on the fish-preprocess
+# Lambda. Pure-cv2 GrabCut (_grabcut_mask below) stays as a local fallback if
+# that call fails, so /predict can still return a usable response.
+# -----------------------
 
 
 # ── Image guardrails ──────────────────────────────────────────────────────────
-MAX_IMAGE_DIM        = 4096   # px — above this rembg risks OOM
+MAX_IMAGE_DIM        = 4096   # px — above this segmentation risks OOM
 MIN_IMAGE_DIM        = 128    # px — below this segmentation is unreliable
 MAX_B64_BYTES        = 5 * 1024 * 1024   # 5 MB of raw base64 text
 
@@ -220,7 +222,7 @@ def invoke_sagemaker(b64_image: str) -> dict:
 # -----------------------
 
 
-# ── Fish detection via rembg ──────────────────────────────────────────────────
+# ── Fish detection via remote rembg Lambda (local GrabCut fallback) ───────────
 
 def _grabcut_mask(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
@@ -249,38 +251,77 @@ def _grabcut_mask(image: np.ndarray) -> np.ndarray:
         return np.full((h, w), 255, dtype=np.uint8)
 
 
-def detect_fish(image: np.ndarray):
-    H, W = image.shape[:2]
+# --- CHANGED SECTION: preprocessing moved to Lambda ---
+def invoke_preprocessing_lambda(b64_image: str) -> dict:
+    """
+    Calls the fish-preprocess Lambda, which runs rembg (U²-Net) segmentation
+    server-side. Returns {"status": "success", "bbox": [...], "mask_base64": "<PNG>"},
+    {"status": "rejected", "detail": ...}, or {"status": "error", "detail": ...}
+    on any local/network failure (never raises — caller decides how to degrade).
+    """
+    try:
+        resp = _lambda_client.invoke(
+            FunctionName=LAMBDA_PREPROCESSING_FUNCTION,
+            InvocationType="RequestResponse",
+            Payload=json.dumps({"image_base64": b64_image}).encode(),
+        )
+        payload = json.loads(resp["Payload"].read())
+        if resp.get("FunctionError"):
+            return {"status": "error", "detail": str(payload)}
+        return payload
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
 
-    if REMBG_AVAILABLE:
-        pil_img = _PILImage.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        rgba    = np.array(_rembg_remove(pil_img))
-        alpha   = rgba[:, :, 3]
-        raw_mask = (alpha > 128).astype(np.uint8) * 255
-    else:
-        raw_mask = _grabcut_mask(image)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask   = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    mask   = cv2.morphologyEx(mask,     cv2.MORPH_OPEN,  kernel, iterations=1)
-
+def _bbox_from_mask(mask: np.ndarray, H: int, W: int):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None, None
+        return None
 
     min_area = H * W * 0.01          # ignore noise < 1 % of image
     valid    = [c for c in contours if cv2.contourArea(c) >= min_area]
     if not valid:
         valid = contours             # last resort: take whatever exists
 
-    largest  = max(valid, key=cv2.contourArea)
+    largest    = max(valid, key=cv2.contourArea)
     x, y, w, h = cv2.boundingRect(largest)
 
     px = int(w * 0.05);  py = int(h * 0.05)
     x1 = max(0, x - px);  y1 = max(0, y - py)
     x2 = min(W, x + w + px);  y2 = min(H, y + h + py)
 
-    return (x1, y1, x2, y2), mask
+    return (x1, y1, x2, y2)
+
+
+def detect_fish(image: np.ndarray, b64_image: str):
+    H, W = image.shape[:2]
+
+    result = invoke_preprocessing_lambda(b64_image)
+
+    if result.get("status") == "success":
+        mask_bytes = base64.b64decode(result["mask_base64"])
+        mask_arr   = np.frombuffer(mask_bytes, np.uint8)
+        mask       = cv2.imdecode(mask_arr, cv2.IMREAD_GRAYSCALE)
+        if mask is not None:
+            return tuple(result["bbox"]), mask
+        # fall through to local fallback if the returned mask was corrupt
+
+    elif result.get("status") == "rejected":
+        # Genuine "no fish visible" determination from the Lambda — not a
+        # failure, so don't mask it with a local fallback.
+        return None, None
+
+    # Lambda unreachable/errored — degrade to local pure-cv2 GrabCut
+    raw_mask = _grabcut_mask(image)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask   = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    mask   = cv2.morphologyEx(mask,     cv2.MORPH_OPEN,  kernel, iterations=1)
+
+    bbox = _bbox_from_mask(mask, H, W)
+    if bbox is None:
+        return None, None
+    return bbox, mask
+# -----------------------
 
 
 # ── Background suppression ────────────────────────────────────────────────────
@@ -349,7 +390,7 @@ def predict(request: Request, req: ImageRequest):
     conf  = result["prediction"]["confidence"]
     # -----------------------
 
-    bbox, full_mask = detect_fish(image)
+    bbox, full_mask = detect_fish(image, req.image_base64)
     if bbox is None:
         raise HTTPException(status_code=422, detail="No fish foreground could be segmented")
 
@@ -393,7 +434,7 @@ def predict(request: Request, req: ImageRequest):
             "timestamp":         datetime.now(timezone.utc).isoformat(),
             "processing_time_ms": processing_ms,
             "model_versions": {
-                "segmentor":  "U²-Net (rembg)",
+                "segmentor":  "U²-Net (rembg, remote Lambda)",
                 "classifier": "EfficientNetV2S (SageMaker remote)",
             },
         },

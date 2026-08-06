@@ -9,7 +9,6 @@ dependencies = [
     "fastapi>=0.135.3",
     "numpy>=2.4.4",
     "opencv-python-headless>=4.13.0.92",
-    "rembg[cpu]>=2.0.74",
     "uvicorn>=0.43.0",
     "groq>=0.9.0",
     "python-dotenv>=1.0.0",
