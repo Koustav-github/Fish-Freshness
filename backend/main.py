@@ -1,6 +1,7 @@
 import base64
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -37,17 +38,34 @@ _groq_client   = Groq(api_key=GROQ_API_KEY, timeout=15.0) if GROQ_API_KEY else N
 # endpoint instead of loading the .pt/.onnx models in-process.
 SAGEMAKER_ENDPOINT_NAME = os.getenv("SAGEMAKER_ENDPOINT_NAME", "fish-freshness-koustav-JU-km").strip()
 AWS_REGION              = os.getenv("AWS_REGION", "us-east-1").strip()
-# --- CHANGED SECTION: diagnose 180s+ hang ---
-# Explicit connect/read timeouts on both AWS clients — without these, boto3
-# has no hard upper bound and a stalled connection can hang far longer than
-# expected, which is exactly what we're trying to rule out here.
-_boto_config = boto3.session.Config(connect_timeout=10, read_timeout=60, retries={"max_attempts": 1})
-_sagemaker_runtime      = boto3.client("sagemaker-runtime", region_name=AWS_REGION, config=_boto_config)
+# --- CHANGED SECTION: SageMaker cold-start retries ---
+# SageMaker serverless endpoints scale to zero when idle; the first request
+# after that can hit ModelNotReadyException while it spins back up — AWS's
+# own guidance is to retry with backoff, since it normally self-resolves in
+# a few seconds. max_attempts=1 (no retry) turns that into a hard user-facing
+# failure instead, so this client gets real retries.
+_sagemaker_config  = boto3.session.Config(connect_timeout=10, read_timeout=60, retries={"max_attempts": 3, "mode": "standard"})
+_sagemaker_runtime = boto3.client("sagemaker-runtime", region_name=AWS_REGION, config=_sagemaker_config)
+# -----------------------
 
 # rembg-based segmentation now runs on a separate Lambda instead of in-process,
 # so this Render deploy doesn't need to carry rembg's ~300MB dependency chain.
 LAMBDA_PREPROCESSING_FUNCTION = os.getenv("LAMBDA_PREPROCESSING_FUNCTION", "fish-preprocess").strip()
-_lambda_client                = boto3.client("lambda", region_name=AWS_REGION, config=_boto_config)
+# --- CHANGED SECTION: diagnose 180s+ hang ---
+# This client keeps max_attempts=1 deliberately — the earlier 180s hang was a
+# genuinely stuck downstream call (fish-preprocess), not a fast-failing cold
+# start, so retrying it would only make a real hang worse, not better.
+_lambda_config = boto3.session.Config(connect_timeout=10, read_timeout=60, retries={"max_attempts": 1})
+_lambda_client = boto3.client("lambda", region_name=AWS_REGION, config=_lambda_config)
+# -----------------------
+
+# --- CHANGED SECTION: parallelize independent AWS calls ---
+# Classification (SageMaker) and segmentation (fish-preprocess) don't depend
+# on each other's results, but were previously called sequentially — when
+# both happen to be cold at once, that means paying the FULL sum of both
+# cold-start times (e.g. ~50s + ~100s) instead of just the larger one.
+# Reused across warm Lambda invocations, not recreated per request.
+_executor = ThreadPoolExecutor(max_workers=4)
 # -----------------------
 
 
@@ -309,13 +327,12 @@ def _bbox_from_mask(mask: np.ndarray, H: int, W: int):
     return (x1, y1, x2, y2)
 
 
-def detect_fish(image: np.ndarray, b64_image: str):
+# --- CHANGED SECTION: parallelize independent AWS calls ---
+# Split from the old detect_fish() so the network call (invoke_preprocessing_lambda)
+# can be fired off in parallel with invoke_sagemaker, while this pure
+# result-processing step runs afterward once both are back.
+def _process_preprocessing_result(image: np.ndarray, result: dict):
     H, W = image.shape[:2]
-
-    print("[timing] detect_fish: calling invoke_preprocessing_lambda...")
-    _t = time.perf_counter()
-    result = invoke_preprocessing_lambda(b64_image)
-    print(f"[timing] detect_fish: invoke_preprocessing_lambda done in {time.perf_counter()-_t:.1f}s, status={result.get('status')}")
 
     if result.get("status") == "success":
         mask_bytes = base64.b64decode(result["mask_base64"])
@@ -331,10 +348,10 @@ def detect_fish(image: np.ndarray, b64_image: str):
         return None, None
 
     # Lambda unreachable/errored — degrade to local pure-cv2 GrabCut
-    print(f"[timing] detect_fish: falling back to local GrabCut, image shape={image.shape}...")
+    print(f"[timing] preprocessing fallback: falling back to local GrabCut, image shape={image.shape}...")
     _t = time.perf_counter()
     raw_mask = _grabcut_mask(image)
-    print(f"[timing] detect_fish: GrabCut done in {time.perf_counter()-_t:.1f}s")
+    print(f"[timing] preprocessing fallback: GrabCut done in {time.perf_counter()-_t:.1f}s")
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask   = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
     mask   = cv2.morphologyEx(mask,     cv2.MORPH_OPEN,  kernel, iterations=1)
@@ -390,11 +407,15 @@ def predict(req: ImageRequest):
     original_b64 = cv2_to_b64(image)
     H, W = image.shape[:2]
 
-    # --- CHANGED SECTION: AWS SageMaker integration ---
-    # One remote call replaces the local yolo_fish_present() + classify() pair —
-    # the SageMaker endpoint runs the YOLO presence-gate and ONNX classifier together.
-    print(f"[timing] t={time.perf_counter()-t0:.1f}s calling invoke_sagemaker...")
-    result = invoke_sagemaker(req.image_base64)
+    # --- CHANGED SECTION: parallelize independent AWS calls ---
+    # Classification (SageMaker) and segmentation (fish-preprocess) are
+    # independent — fire both off at once instead of paying their cold-start
+    # times sequentially.
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s submitting invoke_sagemaker + invoke_preprocessing_lambda in parallel...")
+    sagemaker_future     = _executor.submit(invoke_sagemaker, req.image_base64)
+    preprocessing_future = _executor.submit(invoke_preprocessing_lambda, req.image_base64)
+
+    result = sagemaker_future.result()
     print(f"[timing] t={time.perf_counter()-t0:.1f}s invoke_sagemaker done")
 
     if result.get("status") == "rejected":
@@ -409,11 +430,12 @@ def predict(req: ImageRequest):
     # in inference.py, from the classifier's own feature-map output — not a
     # placeholder. Falls back to None if an older inference.py is deployed.
     gradcam_b64 = result.get("gradcam_base64")
-    # -----------------------
 
-    print(f"[timing] t={time.perf_counter()-t0:.1f}s calling detect_fish...")
-    bbox, full_mask = detect_fish(image, req.image_base64)
-    print(f"[timing] t={time.perf_counter()-t0:.1f}s detect_fish done")
+    preprocessing_result = preprocessing_future.result()
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s invoke_preprocessing_lambda done, status={preprocessing_result.get('status')}")
+    bbox, full_mask = _process_preprocessing_result(image, preprocessing_result)
+    print(f"[timing] t={time.perf_counter()-t0:.1f}s preprocessing result processed")
+    # -----------------------
     if bbox is None:
         raise HTTPException(status_code=422, detail="No fish foreground could be segmented")
 
