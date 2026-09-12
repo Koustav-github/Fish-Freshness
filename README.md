@@ -8,6 +8,8 @@
 
 **Team:** Koustav Manna · Satyam Singh
 
+**Disclaimer:** This project was developed in Hackforge Hackathon organized by CodeClub JUSL. The repository was initially created owned by them. I could not transfer the ownership to myself and the original repo is Private. So, I have re-initialized the whole project to my personal github and made certain modifications in the aws integration. Hope that explains fewer commits and clean branch.
+
 ---
 
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
